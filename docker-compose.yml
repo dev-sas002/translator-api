@@ -1,0 +1,29 @@
+version: "3"
+
+services:
+  db:
+    image: postgres
+    restart: always
+    environment:
+      POSTGRES_PASSWORD: examplepassword
+      POSTGRES_USER: exampleuser
+      POSTGRES_DB: exampledb
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: bash -c "rm -f tmp/pids/server.pid && bundle exec rails s -p 3000 -b '0.0.0.0'"
+    restart: always
+    depends_on:
+      - db
+    environment:
+      RAILS_ENV: development
+      DATABASE_NAME: exampleuser
+      DATABASE_USERNAME: exampleuser
+      DATABASE_PASSWORD: examplepassword
+      DATABASE_HOST: db
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/translator-api
