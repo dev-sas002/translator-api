@@ -11,9 +11,6 @@
 # It's strongly recommended that you check this file into your version control system.
 
 ActiveRecord::Schema[7.0].define(version: 2023_03_21_183248) do
-  # These are extensions that must be enabled in order to support this database
-  enable_extension "plpgsql"
-
   create_table "glossaries", force: :cascade do |t|
     t.string "source_language_code", null: false
     t.string "target_language_code", null: false
@@ -24,7 +21,7 @@ ActiveRecord::Schema[7.0].define(version: 2023_03_21_183248) do
   create_table "terms", force: :cascade do |t|
     t.string "source_term", null: false
     t.string "target_term", null: false
-    t.bigint "glossary_id", null: false
+    t.integer "glossary_id", null: false
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
     t.index ["glossary_id"], name: "index_terms_on_glossary_id"
@@ -34,7 +31,7 @@ ActiveRecord::Schema[7.0].define(version: 2023_03_21_183248) do
     t.string "source_language_code", null: false
     t.string "target_language_code", null: false
     t.string "source_text", limit: 5000, null: false
-    t.bigint "glossary_id"
+    t.integer "glossary_id"
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
     t.index ["glossary_id"], name: "index_translations_on_glossary_id"
