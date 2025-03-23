@@ -44,6 +44,11 @@ group :development, :test do
   gem "rspec-rails", "~> 6.0.0"
   gem "factory_bot_rails"
   gem "faker"
+  # Use SQLite for the test environment so the suite can run without an external
+  # Postgres instance (for example in CI).
+  # ActiveRecord's sqlite adapter depends on `sqlite3 (~> 1.4)`,
+  # so we pin to a compatible version to avoid activation conflicts.
+  gem "sqlite3", "~> 1.4"
 end
 
 group :development do
