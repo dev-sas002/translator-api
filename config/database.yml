@@ -1,0 +1,24 @@
+# Development and production use PostgreSQL; the test environment uses SQLite
+# so the suite runs with no database server (see the README's Development
+# section). spec/environment/database_adapter_spec.rb fails if that changes
+# without the setup instructions changing with it.
+default: &default
+  adapter: postgresql
+  encoding: unicode
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS", 5) %>
+  username: <%= ENV["DATABASE_USERNAME"] %>
+  password: <%= ENV["DATABASE_PASSWORD"] %>
+  host: <%= ENV["DATABASE_HOST"] %>
+  port: <%= ENV.fetch("DATABASE_PORT", 5432) %>
+
+development:
+  <<: *default
+  database: <%= ENV.fetch("DATABASE_NAME", "translator_api_development") %>
+
+test:
+  adapter: sqlite3
+  database: db/test.sqlite3
+
+production:
+  <<: *default
+  database: <%= ENV.fetch("DATABASE_NAME", "translator_api_production") %>
