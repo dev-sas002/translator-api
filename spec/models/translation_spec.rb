@@ -53,5 +53,20 @@ RSpec.describe Translation, type: :model do
       expect(highlighted).to eq("This <HIGHLIGHT>is</HIGHLIGHT> <HIGHLIGHT>a</HIGHLIGHT> nat test")
       expect(translation.source_text).to eq(original)
     end
+
+    it "returns original source_text when glossary is nil" do
+      translation = create(:translation,
+        source_language_code: "en",
+        target_language_code: "fr",
+        source_text: "This is a nat test",
+        glossary: nil
+      )
+
+      original = translation.source_text.dup
+      serializer = ModifiedSourceTextSerializer.new(translation)
+
+      expect(serializer.source_text).to eq(original)
+      expect(translation.source_text).to eq(original)
+    end
   end
 end
