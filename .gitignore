@@ -28,3 +28,6 @@
 # Ignore master key for decrypting credentials and more.
 /config/master.key
 /config/environment_variables.yml
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
