@@ -31,4 +31,27 @@ RSpec.describe Translation, type: :model do
       end
     end
   end
+
+  describe "serialization" do
+    it "does not mutate source_text when computing highlighted output" do
+      glossary = create(:glossary, source_language_code: "en", target_language_code: "fr")
+      translation = create(:translation,
+        source_language_code: "en",
+        target_language_code: "fr",
+        source_text: "This is a nat test",
+        glossary: glossary
+      )
+
+      create(:term, source_term: "is", target_term: "is", glossary: glossary)
+      create(:term, source_term: "a", target_term: "a", glossary: glossary)
+
+      original = translation.source_text.dup
+
+      serializer = ModifiedSourceTextSerializer.new(translation)
+      highlighted = serializer.source_text
+
+      expect(highlighted).to eq("This <HIGHLIGHT>is</HIGHLIGHT> <HIGHLIGHT>a</HIGHLIGHT> nat test")
+      expect(translation.source_text).to eq(original)
+    end
+  end
 end
