@@ -1,0 +1,30 @@
+.git
+.github
+.gitignore
+
+# Locally installed gems; the image installs its own.
+.bundle
+vendor/bundle
+
+# Test artifacts and scratch space.
+spec
+docs
+coverage
+db/*.sqlite3
+db/*.sqlite3-*
+log/*
+tmp/*
+!tmp/pids/.keep
+
+# Local secrets and editor state.
+config/master.key
+config/environment_variables.yml
+.env
+.env.*
+.idea
+.vscode
+*.swp
+.DS_Store
+
+# A stray Python virtualenv that predates this repo's Ruby layout.
+project_venv
