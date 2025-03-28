@@ -1,419 +1,86 @@
 # Translator API
 
-A JSON API for **glossary-aware text markup**. You register a glossary — a language pair
-plus a list of terms — attach it to a piece of source text, and reading that text back
-returns it with every whole-word occurrence of a glossary term wrapped in markers.
+A Rails 7 API-only service for **glossary-aware markup**. Register a glossary — a language pair plus
+a list of terms — attach it to a piece of source text, and reading that text back returns it with
+every whole-word occurrence of a glossary term wrapped in markers.
 
-Despite the name, **it performs no machine translation and calls no external provider.**
-Matching and markup happen locally, in `app/domain/highlighting/`. There are no API keys to
-configure; the only thing the service needs is a database. A spec stubs `Net::HTTP` to raise
-so that any outbound call introduced later fails the suite loudly.
+## Despite the name, nothing is translated
 
-Jump to the [API reference](#api-reference) for the endpoint list.
+There is **no machine translation here and no external provider.** Nothing is sent anywhere, there are
+no API keys in the tree, and the only dependency is a database. Matching happens locally in
+`app/domain/highlighting/`, and `target_term` is stored and served but never substituted for the
+source term. A regression spec pins that: `spec/requests/translations_spec.rb` stubs both
+`Net::HTTP.start` and `Net::HTTP.new` to raise before exercising the translation endpoints, so an
+outbound call introduced later fails the suite loudly rather than quietly acquiring one.
 
-## Captured output
+## A round trip
 
-There is no UI. The blocks below are excerpts from
-[`docs/api-session.md`](docs/api-session.md), a full session recorded against a locally
-running instance; [`docs/benchmark.txt`](docs/benchmark.txt) and
-[`docs/test-run.txt`](docs/test-run.txt) hold the rest.
-
-Highlighting, three ways. Terms are matched whole-word and longest-first, so `dogged` and
-`concatenation` are left alone even though `dog` and `cat` are glossary terms:
+From [`docs/api-session.md`](docs/api-session.md), a 24-exchange recorded session, abridged here to
+`source_text`. `dogged` and `concatenation` survive even though `dog` and `cat` are terms:
 
 ```console
-$ curl -X POST http://localhost:8380/translations -H 'Content-Type: application/json' -d '{"translation":{"source_language_code":"en","target_language_code":"fr","glossary_id":1,"source_text":"The cat ate ice cream in New York, and the dogged concatenation stayed put."}}'
-HTTP 201
-{
-  "id": 5,
-  "source_language_code": "en",
-  "target_language_code": "fr",
-  "source_text": "The cat ate ice cream in New York, and the dogged concatenation stayed put.",
-  "glossary_id": 1
-}
-
 $ curl http://localhost:8380/translations/5
-HTTP 200
-{
-  "id": 5,
-  "source_language_code": "en",
-  "target_language_code": "fr",
   "source_text": "The <HIGHLIGHT>cat</HIGHLIGHT> ate <HIGHLIGHT>ice cream</HIGHLIGHT> in <HIGHLIGHT>New York</HIGHLIGHT>, and the dogged concatenation stayed put.",
-  "glossary_id": 1
-}
-
 $ curl 'http://localhost:8380/translations/5?markup=mark'
-HTTP 200
-{
-  "id": 5,
-  "source_language_code": "en",
-  "target_language_code": "fr",
-  "source_text": "The <mark>cat</mark> ate <mark>ice cream</mark> in <mark>New York</mark>, and the dogged concatenation stayed put.",
-  "glossary_id": 1
-}
+  "source_text": "The <mark>cat</mark> ate <mark>ice cream</mark> in <mark>New York</mark>, and ...",
 ```
 
-A glossary can be case-insensitive; the original casing of the text is preserved:
+The rules, all pinned by `spec/domain/highlighting/matcher_spec.rb`: matches are **whole-word** (`cat`
+never fires inside `concatenation`, using Ruby's default `\w`, i.e. `[0-9A-Za-z_]`) and
+**leftmost-longest** (with both `New` and `New York` registered, `New York` wins and the shorter term
+cannot split the span). Terms are **literals, never patterns** — one containing `5$` or `(` matches
+those characters — and the stored row is never mutated. Case sensitivity is **per glossary**: when
+`case_sensitive` is false the original casing survives, and folding touches a code point only when its
+lowercase form is a single character, since a few (U+0130 among them) lowercase to two and would shift
+every later offset.
 
-```console
-$ curl http://localhost:8380/translations/2
-HTTP 200
-{
-  "id": 2,
-  "source_language_code": "en",
-  "target_language_code": "de",
-  "source_text": "A <HIGHLIGHT>Cat</HIGHLIGHT>, a <HIGHLIGHT>DOG</HIGHLIGHT> and the <HIGHLIGHT>release notes</HIGHLIGHT> are in the <HIGHLIGHT>pull request</HIGHLIGHT>.",
-  "glossary_id": 2
-}
+`Highlighting::Markup` is a registry of marker pairs: `highlight` (default), `mark` and `brackets`
+ship, `?markup=` selects one, an unregistered name gets a `422` listing the known ones, and a fourth is
+one line in an initializer, needing no change to the matcher, controller or serializer:
+
+```ruby
+Highlighting::Markup.register(:xliff, open: "<mrk>", close: "</mrk>")
 ```
 
-Oversized bodies are refused before Rails parses them, and reads are throttled per IP:
-
-```console
-$ { printf '{"translation":{"source_text":"'; head -c 2000000 /dev/zero | tr '\0' 'a'; printf '"}}'; } > /tmp/big.json
-$ wc -c < /tmp/big.json
-2000034
-$ curl -sS -w '\n%{http_code}\n' -X POST http://localhost:8380/translations -H 'Content-Type: application/json' --data-binary @/tmp/big.json
-{"errors":"Request body too large (limit 1048576 bytes)"}
-413
-
-# A burst of 125 reads against the 120-per-minute budget: 109 answered 200 and
-# 16 answered 429, the earlier requests of this session having already spent
-# part of the window. The status-by-status run is in docs/api-session.md.
-$ curl -sS -D - -o /dev/null http://localhost:8380/glossaries | head -1
-HTTP/1.1 429 Too Many Requests
-$ curl -sS http://localhost:8380/glossaries
-{"errors":"Rate limit exceeded. Retry in 60 seconds."}
-$ curl -sS -o /dev/null -w '%{http_code}\n' http://localhost:8380/health   # health checks are safelisted
-200
-```
-
-The suite and the linter:
-
-```console
-$ bundle exec rspec
-................................................................................................................................................................................................................................................................
-
-Finished in 1.17 seconds (files took 1.33 seconds to load)
-256 examples, 0 failures
-
-$ bundle exec standardrb
-(no output: no offenses)
-```
-
-## Architecture
-
-The application is a thin HTTP layer over a plain-Ruby domain. Controllers parse and
-render; models own persistence and validation; everything about *matching and marking up
-text* lives in the `Highlighting` namespace, which knows nothing about HTTP and — apart
-from one adapter class — nothing about ActiveRecord. That is what makes the matcher
-benchmarkable and exhaustively testable without a database.
-
-Dependencies point inward: `Highlighting::GlossaryHighlighter` is the only part of the
-domain that touches ActiveRecord, and nothing in the domain refers to a controller,
-a serializer or a request.
+## Three tables
 
 ```mermaid
-flowchart TB
-  subgraph edge["Rack edge"]
-    RBL["RequestBodyLimit<br/><i>lib/ — 413 before parsing</i>"]
-    RA["Rack::Attack<br/><i>per-IP throttle, 429</i>"]
-  end
-
-  subgraph http["HTTP layer — app/controllers"]
-    AC["ApplicationController<br/><i>rescue_from → JSON 400/404/422</i>"]
-    GC["GlossariesController<br/><i>+ Paginated</i>"]
-    TC["TermsController"]
-    XC["TranslationsController"]
-    HC["HealthController"]
-  end
-
-  subgraph ser["Serialization — app/serializers"]
-    MS["ModifiedSourceTextSerializer"]
-    GS["GlossarySerializer"]
-  end
-
-  subgraph domain["Domain — app/domain/highlighting"]
-    GH["GlossaryHighlighter<br/><i>the only AR-aware class</i>"]
-    MC["MatcherCache<br/><i>bounded LRU, version-keyed</i>"]
-    AD["AdaptiveMatcher<br/><i>picks by glossary size</i>"]
-    RM["RegexpMatcher"]
-    AM["AutomatonMatcher"]
-    AU["Automaton<br/><i>Aho-Corasick</i>"]
-    MK["Markup<br/><i>style registry</i>"]
-  end
-
-  subgraph data["Persistence — app/models"]
-    GL["Glossary"]
-    TE["Term"]
-    TR["Translation"]
-    DB[("PostgreSQL<br/><i>SQLite under test</i>")]
-  end
-
-  RBL --> RA --> AC
-  AC --> GC & TC & XC & HC
-  GC --> GS
-  XC --> MS
-  MS --> GH
-  GH --> MC --> AD
-  AD --> RM & AM
-  AM --> AU
-  GH --> MK
-  GC --> GL
-  TC --> TE
-  XC --> TR
-  GL & TE & TR --> DB
+erDiagram
+    GLOSSARY ||--o{ TERM : "has_many, dependent destroy"
+    GLOSSARY |o--o{ TRANSLATION : "optional, FK ON DELETE SET NULL"
+    GLOSSARY {
+        string source_language_code "ISO 639-1 - unique together"
+        string target_language_code "ISO 639-1 - unique together"
+        boolean case_sensitive "not null, default true"
+    }
+    TERM {
+        string source_term "what the matcher scans for"
+        string target_term "stored, never substituted"
+    }
+    TRANSLATION {
+        bigint glossary_id FK "nullable, must match the pair"
+        string source_text "not null, limit 5000"
+    }
 ```
 
-## Request flow
+Both codes must be in `Glossary::ISO_639_1_CODES` (183 currently assigned codes; deprecated `bh`,
+`sh`, `in` and `iw` are rejected). The invariants live in the database, not only in the model: the
+unique index on the language pair, `index_terms_on_glossary_id_and_source_term` covering the only
+query the highlighter makes, and the FK on `translations.glossary_id` being `ON DELETE SET NULL`, so
+deleting a glossary detaches its translations rather than orphaning them.
+`spec/models/database_constraints_spec.rb` inserts behind the validations with `insert_all!` to prove
+all three; those examples pass on SQLite, which the suite runs on, and the same checks were re-run
+against a scratch PostgreSQL database loaded from `db/schema.rb`, where the delete nullified and both
+bad inserts raised too.
 
-`GET /translations/:id` is the path that does real work. Everything else is CRUD.
+## What a read actually costs
 
-```mermaid
-sequenceDiagram
-  autonumber
-  participant C as Client
-  participant M as RequestBodyLimit + Rack::Attack
-  participant K as TranslationsController
-  participant S as ModifiedSourceTextSerializer
-  participant H as GlossaryHighlighter
-  participant CA as MatcherCache
-  participant X as Matcher (adaptive)
-  participant D as Database
-
-  C->>M: GET /translations/5?markup=mark
-  M->>M: body size ok, under per-IP read limit
-  M->>K: dispatch
-  K->>K: Markup.fetch("mark") — 422 here if unregistered
-  K->>D: SELECT translations WHERE id = 5
-  D-->>K: translation (404 → JSON via rescue_from if absent)
-  K->>S: render with markup: :mark
-  S->>H: call(translation, markup: :mark)
-  H->>D: SELECT glossaries WHERE id = ?
-  D-->>H: glossary (updated_at is the cache version)
-  H->>CA: fetch("adaptive/glossaries/1-20260924.../true")
-
-  alt cache miss
-    CA->>D: SELECT source_term FROM terms WHERE glossary_id = ?
-    Note right of D: covered by<br/>index_terms_on_glossary_id_and_source_term
-    D-->>CA: terms
-    CA->>X: build (regexp below 2500 terms, automaton at or above)
-  else cache hit
-    CA-->>H: matcher, no query
-  end
-
-  H->>X: matches(source_text)
-  X-->>H: non-overlapping [start, length], whole-word, leftmost-longest
-  H->>H: Markup style wraps each span
-  H-->>S: marked-up text
-  S-->>C: 200 {"source_text": "The <mark>cat</mark> ...", ...}
-```
-
-## Quickstart
-
-### Docker
-
-One command, no manual steps. Postgres and the API start together and the database is
-created, migrated and seeded on first boot.
-
-```bash
-docker compose up --build
-```
-
-The API is then on <http://localhost:8380> with three glossaries, twelve terms and four
-translations already loaded:
-
-```bash
-curl http://localhost:8380/health
-curl http://localhost:8380/glossaries
-curl http://localhost:8380/translations/1
-```
-
-Tear down with `docker compose down -v`.
-
-Host ports are **8380** (API) and **8381** (Postgres), chosen to stay clear of the usual
-defaults. Inside the compose network the app talks to Postgres on 5432 as normal.
-
-### Local
-
-```bash
-bin/setup                 # bundle install, db:prepare, db:seed
-bin/rails server          # http://localhost:3000
-```
-
-`bin/setup` needs a reachable PostgreSQL; point it at one with the `DATABASE_*` variables
-below. The **test** suite needs no database server at all — see
-[Development](#development).
-
-## Configuration
-
-Every variable the application reads. None is required for the test suite, and none is an
-API key: there is no third-party service.
-
-| Variable | Required | Default | What it does |
-| --- | --- | --- | --- |
-| `DATABASE_NAME` | no | `translator_api_development` (dev), `translator_api_production` (prod) | Postgres database name |
-| `DATABASE_USERNAME` | no | unset — libpq falls back to the OS user | Postgres user |
-| `DATABASE_PASSWORD` | no | unset | Postgres password |
-| `DATABASE_HOST` | no | unset — libpq falls back to the local socket | Postgres host |
-| `DATABASE_PORT` | no | `5432` | Postgres port |
-| `SECRET_KEY_BASE` | **yes in production** | unset | Rails signing key. `docker-compose.yml` supplies a throwaway value; replace it for a real deployment |
-| `RAILS_ENV` | no | `development` | Rails environment |
-| `PORT` | no | `3000` | Port Puma binds to |
-| `RAILS_MAX_THREADS` | no | `5` | Puma max threads **and** the Active Record pool size |
-| `RAILS_MIN_THREADS` | no | `RAILS_MAX_THREADS` | Puma min threads |
-| `WEB_CONCURRENCY` | no | `0` (single mode) | Puma forked workers; `preload_app!` is enabled when above zero |
-| `PIDFILE` | no | `tmp/pids/server.pid` | Puma pidfile |
-| `MAX_REQUEST_BODY_BYTES` | no | `1048576` (1 MiB) | Bodies above this get `413` before Rails parses them |
-| `RATE_LIMIT_READS_PER_MINUTE` | no | `120` | Per-IP GET budget |
-| `RATE_LIMIT_WRITES_PER_MINUTE` | no | `30` | Per-IP POST/PUT/PATCH/DELETE budget |
-| `HIGHLIGHT_AUTOMATON_THRESHOLD` | no | `2500` | Term count at which the adaptive matcher switches from the regexp scanner to the automaton |
-| `RAILS_LOG_TO_STDOUT` | no | unset | Log to stdout in production (set in the image) |
-| `RAILS_LOG_LEVEL` | no | `info` | Production log level |
-| `RAILS_FORCE_SSL` | no | unset | Redirect to HTTPS and set HSTS in production |
-| `RAILS_SERVE_STATIC_FILES` | no | unset | Serve `public/` from the app in production |
-| `SKIP_DB_SETUP` | no | unset | Set to `1` to stop `entrypoint.sh` running `db:prepare` and `db:seed` |
-| `CI` | no | unset | Eager loads the app in the test environment |
-
-As an alternative to exporting variables, `config/environment.rb` loads an untracked
-`config/environment_variables.yml` at boot if it exists, keyed by Rails environment. A
-missing file or a missing key is simply ignored. The file is in `.gitignore`; do not commit
-credentials.
-
-```yaml
-development:
-  DATABASE_NAME: translator_api_development
-  DATABASE_USERNAME: postgres
-  DATABASE_PASSWORD: postgres
-  DATABASE_HOST: localhost
-```
-
-## Development
-
-Ruby 3.1.3 (see `.ruby-version`) and Bundler. PostgreSQL is needed to *run* the app, but
-not to test it.
-
-```bash
-bundle install
-
-bundle exec rspec                       # whole suite — SQLite, no server needed
-bundle exec rspec spec/domain           # the matching engine alone
-bundle exec standardrb                  # lint
-bundle exec standardrb --fix            # lint and autocorrect
-
-bundle exec rake benchmark:highlighting # the numbers quoted in Design notes
-```
-
-The test environment uses SQLite (`config/database.yml`), which is what lets the suite run
-in CI with no service container. `spec/environment/database_adapter_spec.rb` fails if that
-is changed without the setup instructions changing with it.
-
-`.github/workflows/ci.yml` runs the linter and the suite on every push and pull request,
-with `CI=true` so the app is eager loaded and a constant that only resolves lazily fails
-there rather than in production.
-
-To run the app locally against PostgreSQL:
-
-```bash
-export DATABASE_NAME=translator_api_development DATABASE_HOST=localhost
-bin/rails db:prepare db:seed
-bin/rails server
-```
-
-## Project structure
+Building a matcher is `O(Σ term length)` — for the regexp strategy, a `Regexp.union` over every term
+plus a compile. Doing that per request is the part that scales with glossary size; the scan itself
+barely does. `rake benchmark:highlighting` measures both halves, and `Highlighting::MatcherCache` — a
+bounded process-local LRU keyed by `glossary.cache_key_with_version` — removes the first:
 
 ```
-app/
-  controllers/
-    application_controller.rb      rescue_from → one JSON error shape for 400/404/422
-    concerns/paginated.rb          bounded index endpoints; paging metadata in headers
-    glossaries_controller.rb       index / show / create
-    terms_controller.rb            create, nested under a glossary
-    translations_controller.rb     create / show; resolves the ?markup= style
-    health_controller.rb           GET /health, used by the container healthcheck
-  domain/
-    highlighting.rb                namespace + matching-strategy registry
-    highlighting/
-      matcher.rb                   strategy base: folding, word boundaries,
-                                   leftmost-longest resolution
-      regexp_matcher.rb            alternation of literals, scanned by Onigmo
-      automaton_matcher.rb         single-pass scan over the automaton
-      automaton.rb                 Aho-Corasick, keyed by code point
-      adaptive_matcher.rb          picks a strategy from the glossary's size
-      matcher_cache.rb             bounded LRU, keyed by glossary cache version
-      markup.rb                    registry of marker pairs (the extension point)
-      glossary_highlighter.rb      the one ActiveRecord-aware class in the domain
-  models/                          Glossary, Term, Translation + validations
-  serializers/                     AMS serializers; the highlighting one only delegates
-config/
-  routes.rb                        only the actions that exist are routed
-  database.yml                     Postgres for dev/prod, SQLite for test
-  environment.rb                   optional config/environment_variables.yml loader
-  initializers/
-    rack_attack.rb                 per-IP throttles, /health safelisted
-    wrap_parameters.rb             parameter wrapping deliberately disabled
-db/
-  migrate/                         tables, then the integrity and case-sensitivity changes
-  schema.rb                        dumped from PostgreSQL
-  seeds.rb                         idempotent; three glossaries, twelve terms
-lib/
-  request_body_limit.rb            Rack middleware, 413 before parsing
-  highlighting_benchmark.rb        the benchmark behind the Design notes
-  tasks/benchmark.rake
-spec/
-  domain/                          the matching engine, including strategy parity
-  lib/                             the body-limit middleware
-  models/                          validations, associations, database constraints
-  requests/                        every endpoint, plus pagination, throttling,
-                                   body limits and query counts
-  routing/                         asserts unimplemented actions are not routed
-  serializers/                     the highlighting serializer's public payload
-  environment/                     asserts the test adapter stays SQLite
-  factories/                       FactoryBot definitions
-  support/                         query counter, cache reset, Rack::Attack toggle
-docs/                              captured session, benchmark and test output
-```
-
-## Design notes
-
-### Where the logic lives
-
-The matching logic used to sit inside an ActiveModel serializer, which meant it could only
-be exercised through a serializer with a persisted record attached. It now lives in
-`Highlighting`, a namespace of plain Ruby objects. `Highlighting::Matcher` takes an array
-of strings and returns character offsets; `Highlighting::Markup` turns offsets into marked-up
-text; `Highlighting::GlossaryHighlighter` is the single adapter that reads a `Translation`
-and its `Glossary`. The serializer is four lines and delegates.
-
-That split is what makes `rake benchmark:highlighting` possible at all — it drives the
-matcher directly, with no database and no HTTP.
-
-Matching semantics, all covered by specs:
-
-- **Whole-word only.** A term matches when the characters on either side are not word
-  characters, so `cat` does not fire inside `concatenation`.
-- **Leftmost-longest.** With both `New` and `New York` in the glossary, `New York` wins and
-  the shorter term cannot split the span.
-- **Literal, never a pattern.** A term containing `5$` or `(` matches those characters.
-- **Case sensitivity is per glossary.** `glossaries.case_sensitive` defaults to `true`, so
-  existing glossaries behave exactly as before. When it is false, folding is done in a way
-  that cannot shift character offsets: a code point is only folded when its lowercase form
-  is a single character, because a few (U+0130, for one) lowercase to two and would move
-  every offset after them.
-- **The text is never mutated.** Rendering is a pure function of the stored row.
-
-### Scalability: what the bottleneck actually was
-
-The original implementation called `Regexp.union` over every glossary term and interpolated
-it into a fresh `Regexp` **on every read**. Matching itself was never the problem; rebuilding
-the matcher on each request was. `rake benchmark:highlighting` measures it — full output in
-[`docs/benchmark.txt`](docs/benchmark.txt):
-
-```
-Ruby 3.1.3 | arm64-darwin23 | 2026-09-24 02:13:05Z
-Each figure is the mean of as many calls as fit in 0.5s.
-Adaptive threshold: 2500 terms.
-
 As shipped: default strategy, one 5000-character text (ms/call)
 terms         picks       rebuild         cached          saved
 10            regexp      0.268           0.228           1.2x
@@ -422,14 +89,24 @@ terms         picks       rebuild         cached          saved
 5000          automaton   8.951           0.935           9.6x
 ```
 
-So the fix is a cache, not a cleverer scanner: `Highlighting::MatcherCache` is a bounded,
-process-local LRU keyed by `glossary.cache_key_with_version`. `Term belongs_to :glossary,
-touch: true` bumps that version whenever a term is created, updated or destroyed, so a
-compiled matcher is never stale — there are specs for each of those three cases.
+That is committed [`docs/benchmark.txt`](docs/benchmark.txt) verbatim; re-running the task on the
+same machine reproduced it within a few percent (1.1× / 1.6× / 4.7× / 9.1×), so treat the last digit
+as noise and the shape as the result. Correctness rides on `Term belongs_to :glossary, touch: true`,
+which bumps the cache key on term create, update **and** destroy — one example each in
+`spec/domain/highlighting/glossary_highlighter_spec.rb` ("rebuilds after a term is added / changed /
+destroyed").
 
-The scanner question is a separate one, and the measurement contradicted the obvious answer.
-An Aho-Corasick automaton scans in a single pass, so its cost is flat in the number of terms,
-but Onigmo does alternation scanning in C while the automaton is pure Ruby:
+## The Aho-Corasick matcher that lost
+
+The scanner is a separate question from the cache, and the part of this repo worth reading, because the
+measurement contradicted the textbook answer. Multi-pattern search over a large term set is exactly
+what Aho-Corasick is for: one pass over the text, cost independent of how many patterns were added. So
+one was written from scratch — `app/domain/highlighting/automaton.rb`, states as indices into parallel
+arrays, transitions keyed by Unicode code point rather than single-character `String`, because
+`String#each_char` allocates a String per character where `each_codepoint` allocates nothing. It works,
+it is flat in N exactly as advertised, and it is **still about three times slower than the regexp it
+was meant to replace** until the glossary reaches thousands of terms, because Onigmo scans an
+alternation in C while this scans in Ruby:
 
 ```
 Warm: matcher already built, highlight one 5000-character text (ms/call)
@@ -440,158 +117,135 @@ terms         automaton       regexp          speedup
 5000          0.933           1.340           1.4x
 ```
 
-The automaton is flat, as advertised — and three times *slower* than the regexp until the
-glossary has thousands of terms. Defaulting to it on asymptotics alone would have made every
-realistic request slower. `Highlighting::AdaptiveMatcher` therefore picks per glossary, with
-the crossover at `HIGHLIGHT_AUTOMATON_THRESHOLD` (2500). Both strategies stay in the tree and
-a spec asserts they agree character-for-character, including on a few hundred randomly
-generated term/text pairs, so the fast path cannot silently drift from the reference one.
+Flat in N, and a loss at every realistic glossary size: shipping it as the default would have made
+almost every request slower in exchange for winning an asymptotic argument. So it is not shipped
+unconditionally. `Highlighting::AdaptiveMatcher` chooses per glossary at
+`HIGHLIGHT_AUTOMATON_THRESHOLD` — default 2500 distinct terms, inside the measured crossover band
+between 1000 and 5000, and movable by environment variable for a host where the crossover lands
+elsewhere. Both strategies stay in the tree as peers in `Highlighting`'s strategy registry, and the
+parity block in `spec/domain/highlighting/matcher_spec.rb` ("strategy parity on random input")
+asserts they agree character-for-character on 200 seeded random term/text pairs, so the fast path
+cannot drift from the reference one.
 
-The rest of the scalability work:
+The summary: a real algorithm was implemented, benchmarked, found to lose on this workload, and kept
+behind a measured switch rather than shipped on faith or quietly deleted.
 
-- **Queries.** `GET /glossaries` eager loads terms; a spec asserts the query count does not
-  grow with the number of glossaries. `GET /translations/:id` deliberately does *not* eager
-  load — terms are only read when the matcher cache misses, so a warm read is two queries
-  whatever the glossary size, and a spec asserts that too.
-- **Indexes.** A unique index on `(source_language_code, target_language_code)`, a composite
-  `(glossary_id, source_term)` on terms that covers the only query the highlighter makes, and
-  the now-redundant single-column index on `terms.glossary_id` dropped.
-- **Integrity in the database, not only in the model.** A foreign key on
-  `translations.glossary_id` with `ON DELETE SET NULL`, so a dangling reference cannot be
-  written by a bulk import or a console session. `spec/models/database_constraints_spec.rb`
-  inserts behind the validations to prove it.
-- **Bounded reads.** `GET /glossaries` is paginated, default 25, hard maximum 100. The body
-  stays a plain JSON array and the paging metadata travels in `X-Page`, `X-Per-Page`,
-  `X-Total-Count` and `X-Total-Pages`, so no existing client breaks.
-- **Bounded writes.** `RequestBodyLimit` answers `413` from `Content-Length`, and wraps
-  `rack.input` so a chunked body that declares no length is stopped mid-stream.
-- **Throttling.** Rack::Attack, separate budgets for reads and writes, `/health` safelisted.
+## Inside a read
 
-### Extensibility
+`GET /translations/:id` is the only endpoint that does real work. Everything else is CRUD.
 
-The seam is `Highlighting::Markup`, a registry of marker pairs. Three are registered
-(`highlight`, `mark`, `brackets`) and `GET /translations/:id?markup=…` selects one; an
-unregistered name returns `422` listing the registered ones. Adding a fourth — XLIFF `<mrk>`
-tags, say — is one line in an initializer and needs no change to the matcher, the controller
-or the serializer:
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant K as TranslationsController
+    participant H as GlossaryHighlighter
+    participant CA as MatcherCache
+    participant X as Matcher
+    participant D as Database
 
-```ruby
-Highlighting::Markup.register(:xliff, open: "<mrk>", close: "</mrk>")
+    C->>K: GET /translations/5?markup=mark, past RequestBodyLimit and Rack::Attack
+    K->>K: Markup.fetch("mark") - 422 here if unregistered
+    K->>D: SELECT translations WHERE id = 5, else 404 as JSON via rescue_from
+    K->>H: call(translation, markup: :mark)
+    H->>D: SELECT glossaries WHERE id = ?
+    D-->>H: glossary - its updated_at is the cache version
+    H->>CA: fetch("adaptive/glossaries/1-2026.../true")
+    alt cache miss
+        CA->>D: SELECT source_term FROM terms WHERE glossary_id = ?
+        Note right of D: served by index_terms_on_glossary_id_and_source_term
+        CA->>X: build - regexp under 2500 terms, automaton above
+    else cache hit
+        CA-->>H: matcher, no third query
+    end
+    H->>X: matches(source_text), then wrap each span in the chosen markers
+    H-->>C: 200
 ```
 
-The matching-strategy registry behind `Highlighting.register_strategy` is the same idea one
-layer down. It is load-bearing rather than speculative: it has two real implementations plus
-the adaptive selector that chooses between them, and it is how the benchmark and the parity
-spec get hold of both.
+A warm read is **two** queries whatever the glossary size, because terms are read only on a cache miss
+— which is why this controller does not eager load, while `GET /glossaries` does.
+`spec/requests/query_count_spec.rb` asserts the exact counts, and that warm equals cold minus one.
 
-### Deliberately not done
+## Running it
 
-**No AI, and no machine translation.** This service stores text and marks up glossary terms;
-adding a model call would change what it *is*, introduce a key to manage, a failure mode to
-degrade from, and an outbound call that the existing no-network guard exists to forbid. The
-honest version of "improve the translation product" here was to improve the thing it actually
-does — the matching engine — and to measure it. If a provider is ever wanted, the place for
-it is a new object alongside `GlossaryHighlighter`, not inside it.
+Ruby 3.1.3 (`.ruby-version`, via rbenv or equivalent). PostgreSQL is needed to run the app but not to
+test it: `config/database.yml` puts the test environment on SQLite, which is what lets CI run with no
+service container, and `spec/environment/database_adapter_spec.rb` fails if that changes without
+these instructions changing with it. `.github/workflows/ci.yml` runs the linter and the suite with
+`CI=true`, eager loading the app so a lazily-resolving constant fails in CI rather than production.
 
-### Smaller changes worth naming
+```bash
+bundle install
+bundle exec rspec                        # 256 examples, 0 failures - SQLite, no server
+bundle exec standardrb                   # zero offenses
+bundle exec rake benchmark:highlighting  # regenerates the tables above
+export DATABASE_NAME=translator_api_development DATABASE_HOST=localhost
+bin/rails db:prepare db:seed             # 3 glossaries, 12 terms, 4 translations
+bin/rails server
+```
 
-- `require "rails/all"` is gone. An API-only app has no use for Action Mailer, Action Cable,
-  Active Storage, Action Text, Action Mailbox or Sprockets; the empty `app/mailers`,
-  `app/channels`, `app/jobs` and `app/views` directories they justified are gone with them.
-- Parameter wrapping is disabled. It was silently rewrapping an unwrapped JSON body under the
-  expected key, so `{"source_text": "hi"}` was accepted over JSON while the same body
-  form-encoded returned `400`. Both now return `400`.
-- `Glossary::ISO_639_1_CODES` was missing 18 real codes, `el` (Greek) among them. It now
-  holds all 183 current ISO 639-1 codes. Deprecated codes (`bh`, `sh`, `in`, `iw`) are still
-  rejected.
-- Error handling moved to `rescue_from` in `ApplicationController`, so `find` and `require`
-  can be used directly instead of nil-checking in every action, and every 400/404/422 has the
-  same `{"errors": "..."}` shape.
+**Docker is unverified.** `Dockerfile` and `docker-compose.yml` exist — multi-stage build, non-root
+`rails` user, `HEALTHCHECK` on `/health`, host ports 8380 and 8381 — and `docker compose config -q`
+exits 0, but the image has never been built or booted here: this repo's uplift report records
+`Build verified: NOT RUN — deferred, RAM constraint` and `Boot verified: NOT RUN — deferred, RAM
+constraint`. Treat `docker compose up --build` as untested; only the local path above has been run.
 
-## Limitations
+Knobs belonging to this service rather than Rails — none a credential, none needed to test:
 
-Things this service does not do. Several are deliberate; all are honest.
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `MAX_REQUEST_BODY_BYTES` | `1048576` (1 MiB) | Bodies above this get `413` before Rails parses them |
+| `RATE_LIMIT_READS_PER_MINUTE` | `120` | Per-IP GET budget |
+| `RATE_LIMIT_WRITES_PER_MINUTE` | `30` | Per-IP write budget |
+| `HIGHLIGHT_AUTOMATON_THRESHOLD` | `2500` | Distinct-term count at which the adaptive matcher switches to the automaton |
+| `SKIP_DB_SETUP` | unset | `1` stops `entrypoint.sh` running `db:prepare` and `db:seed` |
 
-- **No machine translation.** `target_term` is stored and returned, but the output only ever
-  marks up the *source* term. Nothing substitutes one language for another.
-- **No authentication or authorization.** Every endpoint is open. Rate limiting is per IP,
-  which is the only subject available without identity.
-- **Rate limits and the matcher cache are per process.** Both live in process memory, so with
-  `WEB_CONCURRENCY` above one, or several hosts, each worker keeps its own. Point
-  `Rack::Attack.cache.store` at Redis or Memcached before scaling out.
-- **Exact matching only.** No stemming, lemmatisation, accent folding or fuzzy matching:
-  `cats` does not match the term `cat`. Word boundaries use Ruby's default `\w`, which is
-  ASCII-only, so boundary detection is weakest for scripts without ASCII word characters.
-- **Partial CRUD.** Glossaries and terms can be created and read; neither can be updated or
-  deleted over HTTP, and translations cannot be listed. Unimplemented verbs are not routed at
-  all — `spec/routing/routes_spec.rb` asserts that — so they return `404`, not `500`.
-- **`source_text` is capped at 5000 characters** by both the column and a validation.
-- **No background jobs, no shared cache, no search.** Everything happens in the request.
-- **Seed data is fictional** and exists so a fresh boot is not empty.
+`DATABASE_NAME`/`_USERNAME`/`_PASSWORD`/`_HOST`/`_PORT` fall back to libpq's defaults,
+`SECRET_KEY_BASE` is required in production, and the Puma and Rails variables behave as usual.
+`config/environment.rb` also loads an untracked `config/environment_variables.yml` if present, keyed by
+Rails environment; a missing file or key is ignored.
 
-## API reference
+## Endpoints
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/health` | Liveness and readiness; `200` or `503` |
-| `POST` | `/glossaries` | Create a glossary |
-| `GET` | `/glossaries` | List glossaries with their terms (paginated) |
+| `GET` | `/health` | Liveness plus a real `SELECT 1`; `200` or `503` |
+| `POST` | `/glossaries` | Create a glossary (the pair must be unique) |
+| `GET` | `/glossaries` | List with terms; `page`, `per_page` (default 25, max 100) |
 | `GET` | `/glossaries/:id` | One glossary with its terms |
-| `POST` | `/glossaries/:glossary_id/terms` | Add a term to a glossary |
-| `POST` | `/translations` | Store a source text |
-| `GET` | `/translations/:id` | Read it back with glossary terms marked up |
+| `POST` | `/glossaries/:glossary_id/terms` | Add a term; a `glossary_id` in the body is ignored |
+| `POST` | `/translations` | Store a source text verbatim |
+| `GET` | `/translations/:id` | Read it back marked up; `?markup=highlight\|mark\|brackets` |
 
-Anything else is intentionally not routed.
+Index responses stay plain JSON arrays, paging metadata in `X-Page`, `X-Per-Page`, `X-Total-Count`
+and `X-Total-Pages`. Anything not listed is deliberately unrouted — `spec/routing/routes_spec.rb`
+asserts it — so unimplemented verbs `404` rather than `500`. `rescue_from` in `ApplicationController`
+gives every error the same `{"errors": "…"}` body: `400` for a missing wrapper key, `404` for no such
+record, `413` over the body cap, `422` for a validation failure or an unregistered markup name, `429`
+over the per-IP budget with `Retry-After`, `503` when `/health` cannot reach the database.
 
-### Errors
+Both limits are demonstrated rather than asserted in [`docs/api-session.md`](docs/api-session.md):
+`RequestBodyLimit` refused a real 2,000,034-byte body from `Content-Length` before Rails parsed anything
+(it also wraps `rack.input`, so a chunked body declaring no length is stopped mid-stream), and a burst
+of 125 reads against the 120/minute budget returned 109 × `200` and 16 × `429`, counted from the
+transcript, with `/health` safelisted so a probe still answers.
 
-| Status | When | Body |
-| --- | --- | --- |
-| `400` | The top-level wrapper key (`glossary`, `term`, `translation`) is missing | `{"errors": "Required parameter missing: translation"}` |
-| `404` | No such record | `{"errors": "Translation not found"}` |
-| `413` | Request body over `MAX_REQUEST_BODY_BYTES` | `{"errors": "Request body too large (limit 1048576 bytes)"}` |
-| `422` | Validation failure | The ActiveModel error hash, e.g. `{"source_language_code": ["has already been taken"]}` |
-| `422` | Unregistered `markup` | `{"errors": "unknown markup \"neon\" (known: highlight, mark, brackets)"}` |
-| `429` | Over the per-IP budget | `{"errors": "Rate limit exceeded. Retry in 60 seconds."}`, with `Retry-After` |
-| `503` | `/health` cannot reach the database | `{"status": "degraded", "database": "unavailable", ...}` |
+## Known gaps
 
-### Glossaries
+- **No authentication or authorization at all** — every endpoint is open. That is a gap, not a design:
+  choosing a scheme (API keys, JWT, mTLS), a key store and a rotation story is a product decision
+  that cannot be made defensibly from inside this repo, and a half-chosen one is worse than none.
+  Rate limiting is per IP precisely because there is no identity to limit on.
+- **Rate-limit counters and the matcher cache are per process,** not in a shared store, so with
+  `WEB_CONCURRENCY > 1` or more than one host each worker enforces its own budget and keeps its own
+  matchers. Point `Rack::Attack.cache.store` at Redis or Memcached before scaling out; no
+  shared-store deployment has been verified here.
+- **CRUD is partial** — glossaries and terms can be created and read but not updated or deleted over
+  HTTP, and translations cannot be listed.
+- **Exact matching only** — no stemming, lemmatisation, accent folding or fuzzy matching, so `cats`
+  does not match `cat`, and ASCII `\w` boundaries make detection weakest for scripts without ASCII
+  word characters. `source_text` is capped at 5000 characters by both the column and a validation,
+  there are no background jobs and no search, and the seed data is fictional so a fresh boot is not
+  empty.
 
-A glossary is a language pair and a list of terms. The pair must be unique and both codes
-must be in `Glossary::ISO_639_1_CODES`. `case_sensitive` is optional and defaults to `true`.
-
-```bash
-curl -X POST http://localhost:8380/glossaries \
-  -H 'Content-Type: application/json' \
-  -d '{"glossary": {"source_language_code": "en", "target_language_code": "fr"}}'
-```
-
-```json
-{"id":1,"source_language_code":"en","target_language_code":"fr","case_sensitive":true,"terms":[]}
-```
-
-`GET /glossaries` accepts `page` (default 1) and `per_page` (default 25, maximum 100).
-
-### Terms
-
-`source_term` and `target_term` are both required. The glossary comes from the URL; a
-`glossary_id` in the body is ignored. An unknown glossary returns `404`.
-
-```bash
-curl -X POST http://localhost:8380/glossaries/1/terms \
-  -H 'Content-Type: application/json' \
-  -d '{"term": {"source_term": "cat", "target_term": "chat"}}'
-```
-
-### Translations
-
-| Parameter | Required | Notes |
-| --- | --- | --- |
-| `source_language_code` | yes | ISO 639-1 |
-| `target_language_code` | yes | ISO 639-1 |
-| `source_text` | yes | at most 5000 characters |
-| `glossary_id` | no | must exist, and its language pair must match the translation's |
-
-`POST /translations` returns the stored row verbatim. `GET /translations/:id` returns the
-same fields with `source_text` marked up, and accepts `?markup=highlight|mark|brackets`
-(default `highlight`). Without a glossary the text comes back unchanged.
+No UI, so no screenshots. The captured evidence is [`docs/api-session.md`](docs/api-session.md),
+[`docs/benchmark.txt`](docs/benchmark.txt) and [`docs/test-run.txt`](docs/test-run.txt).
